@@ -31,13 +31,17 @@ function send(socket, payload) {
 function members(room) {
   return [...room.clients].map(client => ({ id: client.id, name: client.playerName, ready: client.ready, host: client === room.host }));
 }
-function broadcast(room, payload) { for (const client of room.clients) send(client, payload); }
+function broadcast(room, payload, except = null) {
+  for (const client of room.clients) if (client !== except) send(client, payload);
+}
 function updateRoom(room) { broadcast(room, { type: 'players', room: room.code, players: members(room) }); }
 function leaveRoom(socket) {
   const room = socket.room;
   if (!room) return;
   room.clients.delete(socket);
+  room.states.delete(socket.id);
   socket.room = null;
+  broadcast(room, { type: 'player-left', id: socket.id });
   if (room.clients.size === 0) { rooms.delete(room.code); return; }
   if (room.host === socket) {
     room.host = room.clients.values().next().value;
@@ -55,6 +59,7 @@ function joinRoom(socket, code) {
   socket.room = room;
   room.clients.add(socket);
   send(socket, { type: 'joined', room: room.code, host: false, players: members(room) });
+  for (const state of room.states.values()) send(socket, { type: 'player-state', player: state });
   updateRoom(room);
 }
 
@@ -96,6 +101,7 @@ wss.on('connection', socket => {
   socket.playerName = 'Chercheur';
   socket.ready = false;
   socket.room = null;
+  socket.lastStateAt = 0;
   socket.on('message', raw => {
     let message;
     try { message = JSON.parse(raw.toString()); }
@@ -103,7 +109,7 @@ wss.on('connection', socket => {
     if (!message || typeof message.type !== 'string') return;
     if (message.type === 'create') {
       if (socket.room) leaveRoom(socket);
-      const room = { code: roomCode(), clients: new Set(), host: socket, started: false, createdAt: Date.now() };
+      const room = { code: roomCode(), clients: new Set(), states: new Map(), host: socket, started: false, createdAt: Date.now() };
       socket.playerName = cleanName(message.name);
       socket.ready = true;
       socket.room = room;
@@ -129,6 +135,16 @@ wss.on('connection', socket => {
       if ([...room.clients].some(client => !client.ready)) return send(socket, { type: 'error', message: 'Tout le monde doit être prêt.' });
       room.started = true;
       broadcast(room, { type: 'start', room: room.code });
+    } else if (message.type === 'state') {
+      const now = Date.now();
+      if (now - socket.lastStateAt < 45) return;
+      const p = message.position;
+      const yaw = Number(message.yaw);
+      if (!Array.isArray(p) || p.length !== 3 || !p.every(value => Number.isFinite(value) && Math.abs(value) < 100000) || !Number.isFinite(yaw)) return;
+      socket.lastStateAt = now;
+      const state = { id: socket.id, name: socket.playerName, position: p.map(Number), yaw: ((yaw % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2) };
+      room.states.set(socket.id, state);
+      broadcast(room, { type: 'player-state', player: state }, socket);
     } else if (message.type === 'leave') {
       leaveRoom(socket);
       send(socket, { type: 'left' });
